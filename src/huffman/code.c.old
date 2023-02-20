@@ -1,0 +1,264 @@
+/*
+    encode() and decode() kinda force big endian
+    i'll make a "big endian oriented" version
+    and compare performance
+*/
+
+#include "code.h"
+
+#include <stdlib.h>
+
+#ifdef VERBOSE
+
+#include <stdio.h>
+
+static void print_code(const Code code) {
+    for(int i = code.lenght-1; i >= 0; i--)
+        fprintf(stderr, "%c", code.value & 1 << i ? '1' : '0');
+}
+
+static void print_code_fancy(const Code code, const Node* const node) {
+    byte symbol = node->symbol >= 0x20 && node->symbol <= 0x7e ? node->symbol : ' ' ;
+
+    fprintf(stderr,  YELLOW BOLD "%c " DIM "(%d) " RESET MAGENTA "{%lu}: " RESET GREEN
+            , symbol, node->symbol, node->freq);
+
+    print_code(code);
+    fprintf(stderr, " [%d]\n" RESET, code.lenght);
+    // fprintf(stderr, "\n");
+}
+
+static void print_colored(const Code code) {
+    static char color = 0;
+
+    if(color++%2) fprintf(stderr, MAGENTA);
+    else fprintf(stderr, YELLOW);
+
+    print_code(code);
+
+    fprintf(stderr, RESET);
+}
+
+void print_binary(const array encoded) {
+    for(uint32_t i = 0; i < encoded.size; i++) {
+        if(i % 2) fprintf(stderr, BLUE);
+        else fprintf(stderr, CYAN);
+
+        fprintf(stderr, BINARY_PATTERN, BINARY(encoded.data[i]));
+    }
+    fprintf(stderr, "\n");
+}
+
+#endif
+
+// bitshift to the left and set last bit to zero
+static Code append_0(Code code) {
+    code.value <<= 1;
+    code.lenght++;
+    return code;
+}
+
+
+// bitshift to the left and set last bit to one
+static Code append_1(Code code) {
+    code.value <<= 1;
+    code.value |= 1;
+    code.lenght++;
+    return code;
+}
+
+// recursively traverse tree and calculate codes
+static void calculate_codes(const Node* root, Code* dictionary, Code code) {
+    // if node is leaf both child will be NULL
+    if(root->left == root->right) {
+        dictionary[root->symbol] = code;
+        /* verbose */
+        // print_code_fancy(code, root);
+    }
+
+    // 1 being left and 0 being right is an arbitrary decision
+    else {
+        // if node is lo the right, append a 0
+        if(root->right != 0) {
+            calculate_codes(root->right, dictionary, append_0(code));
+        }
+        // if node is lo the left, append a 1
+        if(root->left != 0) {
+            calculate_codes(root->left, dictionary, append_1(code));
+        }
+    }
+}
+
+Code* gen_dict(Node* root) {
+    /* verbose */
+    TITLE("Get codes");
+
+    Code* dictionary = malloc(BYTEMAX * sizeof(Code));
+
+    // it is a separate function mainly to
+    // abstract away the use of recursion
+    calculate_codes(root, dictionary, (Code){ 0, 0 });
+
+    // tree won't be needed later
+    delete_tree(root);
+
+    return dictionary;
+}
+
+// where the bitwise magic happens...
+array encode(const array uncompressed, Code* dictionary) {
+    array encoded;
+
+    // encoded array will always be <= original
+    // so the same amount of memory will always be enough.
+    // an extra element is needed to store leftover of the last byte
+    // the array has to be empty for the and operator (|) to work
+    encoded.data = calloc(uncompressed.size + 1, sizeof(byte));
+
+    size_t i = 0; // uncompressed index
+    size_t n = 0; // encoded index
+
+    // position inside a byte at which a code begins.
+    // e.g. byte = 00000000, code = 111, offset = 2. Then: byte = 00011100
+    int8_t offset = 8;
+
+    /* verbose */
+    // TITLE("Encode");
+    // fprintf(stderr, "Original: ");
+    // print_binary(uncompressed);
+    // fprintf(stderr, "Encoded: ");
+
+    // this is what happens when bytes are not 8 bits
+    while(i < uncompressed.size) {
+        // at the start of each iteration offset is guaranteed to be > 0
+
+        Code code = dictionary[uncompressed.data[i]];
+
+        // make room for the new code
+        offset -= code.lenght;
+
+        // if the code fits entirely in current byte
+        if(offset >= 0) {
+            // move on to the next uncompressed byte
+            i++;
+
+            // paste the code in the byte at the position
+            // indicated by offset
+            encoded.data[n] |= code.value << offset;
+
+            // if the code perfectly fills the byte
+            if(offset == 0) {
+                // offset has to be > 0 before next iteration
+                offset = 8;
+
+                // move on to next encoded byte
+                n++;
+            }
+            /* verbose */
+            // print_colored(code);
+        }
+
+        // if code needs to be stored across two bytes
+        else {
+            // store code partially in current byte
+            // and move on to the next one
+            encoded.data[n++] |= code.value >> (-offset);
+
+            // offset has to be > 0 before next iteration
+            // the rest of the code will be stored in next byte
+            // code.lenght will be subtracted at next iteration
+            offset += 8 + code.lenght;
+        }
+    }
+
+    /* verbose */
+    // fputs(RESET, stderr);
+
+    // last byte may or may not be complete
+    // number of bits from 0 to 7
+    int8_t leftover = offset;
+
+    // last index in array stores leftover
+    encoded.data[n+1] = leftover; // maybe should be at the beggining who knows
+
+    encoded.size = n+2;
+
+    // dictionary won't be needed later
+    free(dictionary);
+
+    // it is almost certain that encoded.size < file.size
+    // which makes the original allocation wasteful.
+    // this ensures that only the memory that is needed is used
+    encoded.data = realloc(encoded.data, encoded.size);
+
+    return encoded;
+}
+
+// where the magic happens again...
+array decode(const array encoded, Node* root, const size_t size_guess) {
+    array decoded;
+
+    // size_guess will be accurate if the key that was used to compress the
+    // file was the one generated with it.
+    // if used some other key, size_guess will always be >= decoded.size
+    decoded.size = size_guess;
+    decoded.data = malloc(size_guess);
+
+    size_t i = 0; // decoded index
+
+    Node* node = root; // current node
+
+    // n is the index in the encoded array
+    // encoded.size - 2 since the last 2 bytes are special
+    for(size_t n = 0; n < encoded.size - 2; n++) {
+        // bit is the index of the current bit in the current byte.
+        // indexes in a byte: 7654 3210 (7 is msb)
+        for(int8_t bit = 7; bit >= 0; bit--) {
+            // if node is leaf both childs will be NULL
+            if(node->left == node->right) {
+                decoded.data[i++] = node->symbol;
+
+                // reset
+                node = root;
+            }
+            else {
+                bool bit_is_one = encoded.data[n] & 1 << bit;
+
+                if(bit_is_one)
+                    node = node->left;
+                else
+                    node = node->right;
+            }
+        }
+    }
+
+    // last used byte may or may not be complete
+    size_t last_byte = encoded.data[encoded.size-2];
+    int8_t leftover = encoded.data[encoded.size-1];
+
+    for(char bit = 7; bit >= leftover; bit--) {
+        bool bit_is_one = last_byte & 1 << bit;
+
+        if(node->left == node->right) {
+            decoded.data[i++] = node->symbol;
+
+            // reset
+            node = root;
+        }
+        else {
+            if(bit_is_one)
+                node = node->left;
+            else
+                node = node->right;
+        }
+    }
+
+    // tree won't be needed later
+    delete_tree(root);
+
+    // array could be smalled if size_guess was overestimated
+    // this ensures that only the memory that is needed is used
+    decoded.data = realloc(decoded.data, decoded.size);
+
+    return decoded;
+}
