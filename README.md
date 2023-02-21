@@ -12,7 +12,7 @@ Then compile the source code by simply running:
 ```sh
 make
 ```
-The executable will be creates in the working directory.
+The executable will be created in the working directory.
 For information on how to use the program run:
 ```sh
 ./huffman -h
